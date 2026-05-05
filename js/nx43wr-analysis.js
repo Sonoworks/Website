@@ -3,7 +3,7 @@
 //
 // Reuses the existing AuralisationLite analysis modules:
 //   - timeWeight.js  : timeWeight(), signalToSPL(), decimateSignal()
-//   - aWeight.js     : aWeight()    (placeholder; passes signal through)
+//   - freqWeight.js  : freqWeight() — A/C/Z weighting (BS EN 61672-1 design goals)
 //   - octFilt.js     : octFilt()
 //   - fftSPL.js      : fftSPL()
 //   - sonogramSPL.js : sonogramSPL()
@@ -38,6 +38,11 @@ let selectActive = false;
 let selectDragging = false;
 let selectStart = null;       // { plotKey, x } in plot-wrapper-relative pixels
 let selectedRegions = [];     // [{ tStart, tEnd }] sorted ascending
+
+// Cache of the Lp time series displayed on the BS 4142 chart, kept so the
+// L90 tiles can derive percentiles from the same numbers shown on the plot.
+// Sample step is fixed at 100 ms (set in renderBs4142TimeChart).
+let bs4142LpCache = null;     // { values: Float32Array, fw: 'Lin'|'A'|'C' }
 
 // ---------------------------------------------------------------------------
 //  Initialisation
@@ -229,11 +234,11 @@ function runAnalysis() {
     requestAnimationFrame(() => setTimeout(async () => {
         try {
             switch (tab) {
-                case 'timehistory': renderTimeHistory(); break;
-                case 'octave':      await renderOctave(); break;   // resampling is async
-                case 'fft':         renderFFT();         break;
-                case 'spectrogram': renderSpectrogram(); break;
-                case 'bs4142':      await renderBs4142(); break;
+                case 'timehistory': await renderTimeHistory(); break;
+                case 'octave':      await renderOctave();      break;
+                case 'fft':         await renderFFT();         break;
+                case 'spectrogram': await renderSpectrogram(); break;
+                case 'bs4142':      await renderBs4142();      break;
             }
         } catch (e) {
             console.error('Analysis error:', e);
@@ -255,22 +260,20 @@ function hideOverlay() {
 // ---------------------------------------------------------------------------
 //  Tab 1: Level vs. Time
 // ---------------------------------------------------------------------------
-function renderTimeHistory(canvasId = 'timehistoryChart', chartKey = 'timehistory', heightOverride = null) {
+async function renderTimeHistory(canvasId = 'timehistoryChart', chartKey = 'timehistory', heightOverride = null) {
     const tau = getTimeWeightTau();
-    const freqWeight = getFreqWeight();
+    const fw = getFreqWeight();
 
-    let signal = cachedSignalPa;
-    if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
-    // C-weighting not implemented yet — falls through as linear.
+    const { signal: weightedSignal, fs: weightedFs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
-    const weighted = timeWeight(signal, cachedFs, tau);
+    const weighted = timeWeight(weightedSignal, weightedFs, tau);
     const spl = signalToSPL(weighted);
-    const { times, decimated } = decimateSignal(spl, cachedFs);
+    const { times, decimated } = decimateSignal(spl, weightedFs);
 
     const data = times.map((t, i) => ({ x: t, y: decimated[i] }));
-    const ylabel = freqWeight === 'A' ? 'LA (dBA)' :
-                   freqWeight === 'C' ? 'LC (dBC)' :
-                                        'LZ (dB re 20μPa)';
+    const ylabel = fw === 'A' ? 'LA (dBA)' :
+                   fw === 'C' ? 'LC (dBC)' :
+                                'LZ (dB re 20μPa)';
 
     // User-controlled ranges (null = auto)
     const xRange = readRange('xMinTime', 'xMaxTime');
@@ -360,14 +363,19 @@ function renderTimeHistory(canvasId = 'timehistoryChart', chartKey = 'timehistor
 // ---------------------------------------------------------------------------
 async function renderOctave() {
     const bandType = getBandType();      // 'whole' | 'third'
-    const freqWeight = getFreqWeight();  // 'Lin' | 'A' | 'C'
+    const fw = getFreqWeight();          // 'Lin' | 'A' | 'C'
 
-    // octFilt() is hard-coded to expect 48 kHz signals. Resample if needed.
-    const sig48k = await resampleIfNeeded(cachedSignalPa, cachedFs, 48000);
-    let sig = sig48k;
-    if (freqWeight === 'A') sig = aWeight(sig, 48000);
+    // Apply frequency weighting (may return a 48 kHz resampled signal for A/C).
+    const { signal: weightedSignal, fs: weightedFs } =
+        await applyFreqWeight(cachedSignalPa, cachedFs);
 
-    const { freqLabels, spl } = octFilt(sig, bandType);
+    // octFilt requires 48 kHz. If we're not already there (Z weighting at a
+    // non-48 kHz rate), do a second resample.
+    const sig48k = weightedFs === 48000
+        ? weightedSignal
+        : await resampleIfNeeded(weightedSignal, weightedFs, 48000);
+
+    const { freqLabels, spl } = octFilt(sig48k, bandType);
 
     // User-controlled Y range (null = auto)
     const yRange = readRange('yMinLevel', 'yMaxLevel');
@@ -382,7 +390,9 @@ async function renderOctave() {
         data: {
             labels: freqLabels,
             datasets: [{
-                label: freqWeight === 'A' ? 'SPL (dBA)' : 'SPL (dB Lin)',
+                label: fw === 'A' ? 'SPL (dBA)' :
+                       fw === 'C' ? 'SPL (dBC)' :
+                                    'SPL (dB Lin)',
                 data: spl,
                 backgroundColor: colour,
                 borderColor: colour,
@@ -401,7 +411,9 @@ async function renderOctave() {
                 y: {
                     title: {
                         display: true,
-                        text: freqWeight === 'A' ? 'SPL (dBA)' : 'SPL (dB re 20μPa)',
+                        text: fw === 'A' ? 'SPL (dBA)' :
+                              fw === 'C' ? 'SPL (dBC)' :
+                                           'SPL (dB re 20μPa)',
                         color: '#e0e0e0'
                     },
                     min: yRange.min,
@@ -421,22 +433,20 @@ async function renderOctave() {
 // ---------------------------------------------------------------------------
 //  Tab 3: FFT Spectrum
 // ---------------------------------------------------------------------------
-function renderFFT() {
+async function renderFFT() {
     const nfft = getFftSize();
     const useWindow = getUseWindow();
-    const freqWeight = getFreqWeight();
+    const fw = getFreqWeight();
 
-    let signal = cachedSignalPa;
-    if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
-    // C-weighting: passes through unchanged for now (placeholder).
+    const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
-    const { freq, spl } = fftSPL(signal, cachedFs, nfft, useWindow, 0.5);
+    const { freq, spl } = fftSPL(signal, fs, nfft, useWindow, 0.5);
 
     // User-controlled ranges with sensible defaults
     const xRange = readRange('xMinFreq', 'xMaxFreq');
     const yRange = readRange('yMinLevel', 'yMaxLevel');
     const minFreq = xRange.min !== null ? xRange.min : 20;
-    const maxFreq = xRange.max !== null ? xRange.max : Math.min(20000, cachedFs / 2);
+    const maxFreq = xRange.max !== null ? xRange.max : Math.min(20000, fs / 2);
 
     const data = [];
     for (let i = 0; i < freq.length; i++) {
@@ -445,9 +455,9 @@ function renderFFT() {
         }
     }
 
-    const ylabel = freqWeight === 'A' ? 'SPL (dBA)' :
-                   freqWeight === 'C' ? 'SPL (dBC)' :
-                                        'SPL (dB re 20μPa)';
+    const ylabel = fw === 'A' ? 'SPL (dBA)' :
+                   fw === 'C' ? 'SPL (dBC)' :
+                                'SPL (dB re 20μPa)';
 
     document.getElementById('chartSubtitle').textContent = cachedFileName;
     if (charts.fft) charts.fft.destroy();
@@ -511,16 +521,14 @@ function renderFFT() {
 // ---------------------------------------------------------------------------
 //  Tab 4: Spectrogram
 // ---------------------------------------------------------------------------
-function renderSpectrogram(wrapperId = 'spectrogramWrapper', canvasId = 'spectrogramCanvas') {
+async function renderSpectrogram(wrapperId = 'spectrogramWrapper', canvasId = 'spectrogramCanvas') {
     const nfft = getFftSize();
     const useWindow = getUseWindow();
-    const freqWeight = getFreqWeight();
 
-    let signal = cachedSignalPa;
-    if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+    const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
     const { freq, time, spec, nBins, nFrames } =
-        sonogramSPL(signal, cachedFs, nfft, useWindow, 0.75);
+        sonogramSPL(signal, fs, nfft, useWindow, 0.75);
 
     // Auto-determine colour limits from data
     let globalMax = -Infinity;
@@ -659,18 +667,136 @@ function splToColour(value, minDb, maxDb) {
 //  annotations on the time chart). Leq is computed at the top.
 // ---------------------------------------------------------------------------
 async function renderBs4142() {
-    // 1. Time history into the BS 4142 time canvas
-    renderTimeHistory('bs4142TimeChart', 'bs4142Time', /*heightOverride*/ 240);
+    // 1. Custom time chart with two traces: Lp at 100 ms and Leq at 10 ms.
+    //    Not the same plot the standalone tab uses — that's a single trace.
+    await renderBs4142TimeChart();
 
     // 2. Spectrogram into the BS 4142 spectrogram wrapper. Note this also
     //    sets `spectrogramTimeRange` — we copy it into the BS 4142-specific
     //    cache so its playhead lines up correctly.
-    renderSpectrogram('bs4142SpectrogramWrapper', 'bs4142SpectrogramCanvas');
+    await renderSpectrogram('bs4142SpectrogramWrapper', 'bs4142SpectrogramCanvas');
     bs4142SpectrogramTimeRange = spectrogramTimeRange;
 
     // 3. Refresh the spectrogram region overlay and the Leq display
     drawBs4142SpecRegions();
     updateLeqDisplay();
+}
+
+// Two-trace time chart for the BS 4142 view:
+//   - Lp at 100 ms intervals: time-weighted (F/I/S) and freq-weighted level
+//   - Leq at 10 ms intervals: RMS of the freq-weighted pressure, no time wt
+async function renderBs4142TimeChart() {
+    const tau = getTimeWeightTau();
+    const tauLabel = getTimeWeightLabel();
+    const fw = getFreqWeight();
+
+    const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
+
+    // Lp series: continuous time-weighted SPL, then sample every 100 ms
+    const lp = computeLpTimeSeries(signal, fs, tau, /*stepSec*/ 0.1);
+
+    // Short-time Leq: 10 ms non-overlapping RMS blocks
+    const leqShort = computeLeqShortTime(signal, fs, /*blockSec*/ 0.010);
+
+    // Cache the Lp samples on a global so the Leq tile updater can compute
+    // L90 from the same series displayed on the plot.
+    bs4142LpCache = { values: lp.values, fw };
+
+    const lpLabel  = `Lp ${tauLabel}-${fw === 'Lin' ? 'Z' : fw} (100 ms)`;
+    const leqLabel = `Leq-${fw === 'Lin' ? 'Z' : fw} (10 ms)`;
+    const ylabel   = fw === 'A' ? 'L (dBA)' :
+                     fw === 'C' ? 'L (dBC)' :
+                                  'L (dB re 20μPa)';
+
+    const xRange = readRange('xMinTime', 'xMaxTime');
+    const yRange = readRange('yMinLevel', 'yMaxLevel');
+
+    // Region annotations (existing pattern from the standalone tab)
+    const annotations = {
+        playhead: {
+            type: 'line', scaleID: 'x', value: 0,
+            borderColor: 'rgba(255,255,255,0.85)',
+            borderWidth: 2, borderDash: [4, 4],
+            display: false
+        }
+    };
+    selectedRegions.forEach((r, i) => {
+        annotations['region' + i] = {
+            type: 'box', xScaleID: 'x',
+            xMin: r.tStart, xMax: r.tEnd,
+            backgroundColor: 'rgba(54, 162, 235, 0.20)',
+            borderColor: 'rgba(54, 162, 235, 0.85)',
+            borderWidth: 1,
+            drawTime: 'beforeDatasetsDraw'
+        };
+    });
+
+    if (charts.bs4142Time) charts.bs4142Time.destroy();
+    const ctx = document.getElementById('bs4142TimeChart').getContext('2d');
+
+    charts.bs4142Time = new Chart(ctx, {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: leqLabel,
+                    data: toXYPairs(leqShort.times, leqShort.values),
+                    borderColor: '#cc0000',
+                    borderWidth: 1.0,
+                    pointRadius: 0,
+                    fill: false,
+                    tension: 0,
+                    order: 2     // draws underneath Lp
+                },
+                {
+                    label: lpLabel,
+                    data: toXYPairs(lp.times, lp.values),
+                    borderColor: '#ffffff',
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    fill: false,
+                    tension: 0,
+                    order: 1     // draws on top
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    title: { display: true, text: 'Time (s)', color: '#e0e0e0' },
+                    min: xRange.min !== null ? xRange.min : 0,
+                    max: xRange.max !== null ? xRange.max : cachedDuration,
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#e0e0e0' }
+                },
+                y: {
+                    title: { display: true, text: ylabel, color: '#e0e0e0' },
+                    min: yRange.min, max: yRange.max,
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#e0e0e0' }
+                }
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    align: 'end',
+                    labels: { color: '#e0e0e0', boxWidth: 18, font: { size: 11 } }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(1)} dB`,
+                        title: (c) => `${parseFloat(c[0].parsed.x).toFixed(3)} s`
+                    }
+                },
+                annotation: { annotations }
+            }
+        }
+    });
 }
 
 // Draw the absolutely-positioned region rectangles over the BS 4142
@@ -737,50 +863,54 @@ function updateBs4142Regions() {
 
 // Compute Leq inside vs outside the union of selected regions.
 // Leq = 10·log10( mean(p²) / p_ref² ),  p_ref = 20e-6 Pa
-// Frequency weighting: A applies the existing aWeight() filter; C is a
-// placeholder (passes through).
-function updateLeqDisplay() {
-    const elSel = document.getElementById('bs4142LeqSelected');
-    const elExc = document.getElementById('bs4142LeqExcluded');
+// Frequency weighting: applyFreqWeight() handles A/C/Z, including any
+// resampling needed to reach a supported rate for the IIR coefficients.
+//
+// Async because applyFreqWeight may trigger an OfflineAudioContext resample.
+// A monotonically-increasing generation token guards against rapid clicks
+// causing an older computation to overwrite a newer one — only the most
+// recent invocation is allowed to write to the DOM.
+let _leqGeneration = 0;
+async function updateLeqDisplay() {
+    const myGen = ++_leqGeneration;
+    const elSelLeq = document.getElementById('bs4142LeqSelected');
+    const elExcLeq = document.getElementById('bs4142LeqExcluded');
+    const elSelL90 = document.getElementById('bs4142L90Selected');
+    const elExcL90 = document.getElementById('bs4142L90Excluded');
     const elSelMeta = document.getElementById('bs4142LeqSelectedMeta');
     const elExcMeta = document.getElementById('bs4142LeqExcludedMeta');
-    if (!elSel || !elExc) return;
+    if (!elSelLeq || !elExcLeq) return;
 
-    if (!cachedSignalPa) {
-        elSel.textContent = '—';
-        elExc.textContent = '—';
-        return;
-    }
+    const clear = () => {
+        elSelLeq.textContent = elSelL90.textContent = '—';
+        elExcLeq.textContent = elExcL90.textContent = '—';
+    };
 
-    const freqWeight = getFreqWeight();
-    let signal = cachedSignalPa;
-    if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+    if (!cachedSignalPa) { clear(); return; }
 
-    // Build a boolean "selected" mask over the samples by walking the regions.
-    // Regions are independent ranges in time; sample i is selected iff its
-    // time t_i = i / fs falls inside any region.
+    const fw = getFreqWeight();
+    const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
+    if (myGen !== _leqGeneration) return;   // a newer call superseded us
+
+    // ---- Leq: linear walk over freq-weighted samples ----
+    // Sample i belongs to "selected" iff i / fs is inside any merged region.
     const N = signal.length;
-    const fs = cachedFs;
-    const pRef = 20e-6;
-    const pRefSq = pRef * pRef;
+    const pRefSq = 20e-6 * 20e-6;
+    const eps = 1e-30;
 
     let selSumSq = 0, selCount = 0;
     let excSumSq = 0, excCount = 0;
     let totalSelDuration = 0;
+    const merged = mergeRegions(selectedRegions);
 
-    if (selectedRegions.length === 0) {
-        // Everything is "excluded"; Leq of the whole signal goes there.
+    if (merged.length === 0) {
         for (let i = 0; i < N; i++) excSumSq += signal[i] * signal[i];
         excCount = N;
     } else {
-        // Sort regions and merge overlaps so we can do a single linear walk.
-        const merged = mergeRegions(selectedRegions);
         totalSelDuration = merged.reduce((sum, r) => sum + (r.tEnd - r.tStart), 0);
-
         let regionIdx = 0;
         for (let i = 0; i < N; i++) {
             const t = i / fs;
-            // Advance until t < merged[regionIdx].tEnd or we run out
             while (regionIdx < merged.length && t >= merged[regionIdx].tEnd) regionIdx++;
             const inside = regionIdx < merged.length && t >= merged[regionIdx].tStart;
             const sq = signal[i] * signal[i];
@@ -789,32 +919,167 @@ function updateLeqDisplay() {
         }
     }
 
-    const wLabel = freqWeight === 'A' ? ' dBA' :
-                   freqWeight === 'C' ? ' dBC' :
-                                        ' dB';
+    const selLeq = selCount > 0 ? 10 * Math.log10((selSumSq / selCount) / pRefSq + eps) : null;
+    const excLeq = excCount > 0 ? 10 * Math.log10((excSumSq / excCount) / pRefSq + eps) : null;
 
-    if (selCount > 0) {
-        const leq = 10 * Math.log10((selSumSq / selCount) / pRefSq + 1e-30);
-        elSel.textContent = leq.toFixed(1) + wLabel;
-        elSelMeta.textContent =
+    // ---- L90: 10th percentile of the displayed Lp time series, with the
+    // same in-region / out-of-region split applied to the 100 ms samples. ----
+    let selL90 = null, excL90 = null;
+    if (bs4142LpCache && bs4142LpCache.fw === fw) {
+        const lpVals = bs4142LpCache.values;
+        const stepSec = 0.1;   // matches computeLpTimeSeries default
+        const selSamples = [];
+        const excSamples = [];
+        for (let i = 0; i < lpVals.length; i++) {
+            const t = i * stepSec;
+            const inside = isInsideMergedRegions(t, merged);
+            if (inside) selSamples.push(lpVals[i]);
+            else        excSamples.push(lpVals[i]);
+        }
+        if (selSamples.length > 0) selL90 = computeL90(selSamples);
+        if (excSamples.length > 0) excL90 = computeL90(excSamples);
+    }
+
+    const wLabel = fw === 'A' ? ' dBA' :
+                   fw === 'C' ? ' dBC' :
+                                ' dB';
+
+    // ---- Write to DOM ----
+    if (selLeq !== null) {
+        elSelLeq.textContent = selLeq.toFixed(1) + wLabel;
+        elSelL90.textContent = selL90 !== null ? selL90 + wLabel : '—';
+        elSelMeta.textContent = merged.length === 0 ? 'no selection' :
             selectedRegions.length + ' region' + (selectedRegions.length === 1 ? '' : 's') +
             ', ' + totalSelDuration.toFixed(2) + ' s total';
     } else {
-        elSel.textContent = '—';
+        elSelLeq.textContent = '—';
+        elSelL90.textContent = '—';
         elSelMeta.textContent = 'no selection';
     }
 
-    if (excCount > 0) {
-        const leq = 10 * Math.log10((excSumSq / excCount) / pRefSq + 1e-30);
-        elExc.textContent = leq.toFixed(1) + wLabel;
+    if (excLeq !== null) {
+        elExcLeq.textContent = excLeq.toFixed(1) + wLabel;
+        elExcL90.textContent = excL90 !== null ? excL90 + wLabel : '—';
         const excDuration = (excCount / fs);
-        elExcMeta.textContent = selectedRegions.length === 0
+        elExcMeta.textContent = merged.length === 0
             ? 'whole signal, ' + excDuration.toFixed(2) + ' s'
             : excDuration.toFixed(2) + ' s';
     } else {
-        elExc.textContent = '—';
+        elExcLeq.textContent = '—';
+        elExcL90.textContent = '—';
         elExcMeta.textContent = 'fully selected';
     }
+}
+
+// Helper: is time t inside any of the (already-merged, sorted) regions?
+// Convert two parallel arrays into a Chart.js-friendly array of {x,y}
+// objects. Handles both regular Arrays and TypedArrays. (TypedArray.map
+// returns another TypedArray, which silently coerces objects to NaN —
+// hence this helper exists.)
+function toXYPairs(xs, ys) {
+    const n = Math.min(xs.length, ys.length);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = { x: xs[i], y: ys[i] };
+    return out;
+}
+
+function isInsideMergedRegions(t, merged) {
+    // Linear scan; merged regions are sorted, so we can short-circuit.
+    for (let i = 0; i < merged.length; i++) {
+        if (t < merged[i].tStart) return false;
+        if (t < merged[i].tEnd)   return true;
+    }
+    return false;
+}
+
+// Resample a time-weighted SPL stream onto a regular grid (default 100 ms).
+// `signal` is the freq-weighted pressure signal; we apply the time-weighting
+// integrator at full sample rate, convert to dB SPL, then pick out the value
+// at every stepSec. Returns { times: Float32Array, values: Float32Array }.
+function computeLpTimeSeries(signal, fs, tau, stepSec = 0.1) {
+    const weighted = timeWeight(signal, fs, tau);
+    const spl = signalToSPL(weighted);
+
+    const stride = Math.max(1, Math.round(stepSec * fs));
+    const n = Math.floor(spl.length / stride);
+    const times  = new Float32Array(n);
+    const values = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const sampleIdx = i * stride;
+        times[i]  = sampleIdx / fs;
+        values[i] = spl[sampleIdx];
+    }
+    return { times, values };
+}
+
+// Short-time Leq over consecutive non-overlapping blocks of `blockSec`
+// (default 10 ms). For each block, Leq = 10·log10(mean(p²)/p_ref²).
+function computeLeqShortTime(signal, fs, blockSec = 0.010) {
+    const block = Math.max(1, Math.round(blockSec * fs));
+    const n = Math.floor(signal.length / block);
+    const times  = new Float32Array(n);
+    const values = new Float32Array(n);
+    const pRefSq = 20e-6 * 20e-6;
+    const eps = 1e-30;
+
+    for (let i = 0; i < n; i++) {
+        let sumSq = 0;
+        const start = i * block;
+        for (let j = 0; j < block; j++) {
+            const v = signal[start + j];
+            sumSq += v * v;
+        }
+        times[i]  = (start + block / 2) / fs;   // centre of the block
+        values[i] = 10 * Math.log10(sumSq / block / pRefSq + eps);
+    }
+    return { times, values };
+}
+
+// L90 (10th percentile) of an Lp time series, with values binned to the
+// nearest whole dB. The standard acoustics convention is to histogram in
+// 1 dB bins, then walk down from the highest bin accumulating the count
+// until ≥ 10% of samples have been counted; the level of that bin is L90.
+//
+// Returns the L90 in dB (rounded to integer), or null if the series is empty.
+function computeL90(values) {
+    if (!values || values.length === 0) return null;
+
+    // Find data range
+    let minV = Infinity, maxV = -Infinity;
+    for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        if (!isFinite(v)) continue;
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+    }
+    if (!isFinite(minV) || !isFinite(maxV)) return null;
+
+    const lo = Math.floor(minV);
+    const hi = Math.ceil(maxV);
+    const nBins = hi - lo + 1;
+    if (nBins < 1) return Math.round(minV);
+
+    const bins = new Int32Array(nBins);
+    let total = 0;
+    for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        if (!isFinite(v)) continue;
+        const idx = Math.max(0, Math.min(nBins - 1, Math.round(v) - lo));
+        bins[idx]++;
+        total++;
+    }
+    if (total === 0) return null;
+
+    // Walk DOWN from the highest bin until we've covered 90% of samples;
+    // L90 is the dB level of the bin where the cumulative count first
+    // crosses 90% (i.e. only 10% of samples remain at lower levels).
+    const target = 0.9 * total;
+    let cum = 0;
+    for (let i = nBins - 1; i >= 0; i--) {
+        cum += bins[i];
+        if (cum >= target) return lo + i;
+    }
+    return lo;   // shouldn't reach here, but be safe
 }
 
 // Merge overlapping/adjacent regions so the Leq mask has no double-counting.
@@ -1011,8 +1276,43 @@ function getTimeWeightTau() {
     return 0.125;
 }
 
+function getTimeWeightLabel() {
+    const el = document.querySelector('input[name="timeWeight"]:checked');
+    return el ? el.value : 'F';
+}
+
 function getFreqWeight() {
     return document.querySelector('input[name="freqWeight"]:checked').value;
+}
+
+// Apply the user-selected frequency weighting to a signal.
+//
+// The freqWeight() filter only has tabulated coefficients at 12, 24, and
+// 48 kHz. NX-43WR recordings can be at 12, 24, 48, or other rates depending
+// on configuration. If the signal is at one of the supported rates we
+// filter directly; otherwise we resample to 48 kHz, filter there, and
+// return the 48 kHz signal along with its new sample rate.
+//
+// Returns { signal, fs } so callers know which sample rate to feed into
+// downstream functions. For Z-weighting and supported rates this will
+// match the input fs unchanged.
+async function applyFreqWeight(signal, fs) {
+    const wt = getFreqWeight();
+    // The HTML radio uses 'Lin' to mean Z (no weighting); freqWeight() expects 'Z'.
+    const filterType = (wt === 'Lin') ? 'Z' : wt;
+
+    if (filterType === 'Z') return { signal, fs };
+
+    const supported = freqWeight.supportedSampleRates(filterType) || [];
+    if (supported.includes(Math.round(fs))) {
+        return { signal: freqWeight(signal, fs, filterType), fs };
+    }
+
+    // Resample to the nearest supported rate (48 kHz is the highest and
+    // matches what octFilt already uses, so it's the natural target).
+    const targetFs = 48000;
+    const resampled = await resampleIfNeeded(signal, fs, targetFs);
+    return { signal: freqWeight(resampled, targetFs, filterType), fs: targetFs };
 }
 
 function getBandType() {
@@ -1445,6 +1745,57 @@ function setupResetRange() {
         if (cachedSignalPa) runAnalysis();
     });
 }
+
+// ---------------------------------------------------------------------------
+//  BS 4142 Analysis buttons: Impulse Prominence + Tone Audibility
+// ---------------------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', () => {
+    const impulseBtn = document.getElementById('impulseBtn');
+    const toneBtn    = document.getElementById('toneBtn');
+
+    if (impulseBtn) {
+        impulseBtn.addEventListener('click', async () => {
+            if (!cachedSignalPa) return;
+            showOverlay('Computing impulse prominence…');
+            try {
+                // freqWeight only supports 12/24/48 kHz — resample if needed
+                const supported = freqWeight.supportedSampleRates('A');
+                let signal = cachedSignalPa;
+                let fs     = cachedFs;
+                if (!supported.includes(Math.round(fs))) {
+                    signal = await resampleIfNeeded(signal, fs, 48000);
+                    fs = 48000;
+                }
+                const result = calcImpulseProminence(signal, fs);
+                openImpulseResults(result, cachedFileName);
+            } catch (e) {
+                console.error('Impulse prominence error:', e);
+                showError('Impulse prominence failed: ' + e.message);
+            } finally {
+                hideOverlay();
+            }
+        });
+    }
+
+    if (toneBtn) {
+        toneBtn.addEventListener('click', async () => {
+            if (!cachedSignalPa) return;
+            showOverlay('Computing tone audibility…');
+            try {
+                // JNMv2 uses fftSPL which handles any fs; A-weight correction
+                // is applied analytically in calcToneAudibility (no IIR needed).
+                const nfft   = getFftSize();
+                const result = calcToneAudibility(cachedSignalPa, cachedFs, nfft);
+                openToneResults(result, cachedFileName);
+            } catch (e) {
+                console.error('Tone audibility error:', e);
+                showError('Tone audibility failed: ' + e.message);
+            } finally {
+                hideOverlay();
+            }
+        });
+    }
+});
 
 // ---------------------------------------------------------------------------
 //  Error display

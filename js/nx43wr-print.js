@@ -228,19 +228,19 @@
     // -----------------------------------------------------------------------
     async function pdfTimeHistory(doc) {
         const tau = getTimeWeightTau();
-        const freqWeight = getFreqWeight();
+        const fw = getFreqWeight();
 
-        let signal = cachedSignalPa;
-        if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+        const { signal: weightedSignal, fs: weightedFs } =
+            await applyFreqWeight(cachedSignalPa, cachedFs);
 
-        const weighted = timeWeight(signal, cachedFs, tau);
+        const weighted = timeWeight(weightedSignal, weightedFs, tau);
         const spl = signalToSPL(weighted);
-        const { times, decimated } = decimateSignal(spl, cachedFs);
+        const { times, decimated } = decimateSignal(spl, weightedFs);
 
         const data = times.map((t, i) => ({ x: t, y: decimated[i] }));
-        const ylabel = freqWeight === 'A' ? 'LA (dBA)' :
-                       freqWeight === 'C' ? 'LC (dBC)' :
-                                            'LZ (dB re 20 µPa)';
+        const ylabel = fw === 'A' ? 'LA (dBA)' :
+                       fw === 'C' ? 'LC (dBC)' :
+                                    'LZ (dB re 20 µPa)';
 
         const xRange = readRange('xMinTime', 'xMaxTime');
         const yRange = readRange('yMinLevel', 'yMaxLevel');
@@ -283,15 +283,22 @@
     // -----------------------------------------------------------------------
     async function pdfOctave(doc) {
         const bandType = document.querySelector('input[name="bandType"]:checked').value;
-        const freqWeight = getFreqWeight();
+        const fw = getFreqWeight();
 
-        const sig48k = await resampleIfNeeded(cachedSignalPa, cachedFs, 48000);
-        let sig = sig48k;
-        if (freqWeight === 'A') sig = aWeight(sig, 48000);
+        // Apply weighting first (handles A/C resample to 48 kHz). Then make
+        // sure the signal is at 48 kHz for octFilt — it will be already if
+        // A or C was selected, otherwise resample now.
+        const { signal: weightedSignal, fs: weightedFs } =
+            await applyFreqWeight(cachedSignalPa, cachedFs);
+        const sig = weightedFs === 48000
+            ? weightedSignal
+            : await resampleIfNeeded(weightedSignal, weightedFs, 48000);
 
         const { freqLabels, spl } = octFilt(sig, bandType);
         const yRange = readRange('yMinLevel', 'yMaxLevel');
-        const ylabel = freqWeight === 'A' ? 'SPL (dBA)' : 'SPL (dB re 20 µPa)';
+        const ylabel = fw === 'A' ? 'SPL (dBA)' :
+                       fw === 'C' ? 'SPL (dBC)' :
+                                    'SPL (dB re 20 µPa)';
 
         const png = await renderChartToPng({
             type: 'bar',
@@ -327,17 +334,16 @@
     async function pdfFFT(doc) {
         const nfft = getFftSize();
         const useWindow = getUseWindow();
-        const freqWeight = getFreqWeight();
+        const fw = getFreqWeight();
 
-        let signal = cachedSignalPa;
-        if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+        const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
-        const { freq, spl } = fftSPL(signal, cachedFs, nfft, useWindow, 0.5);
+        const { freq, spl } = fftSPL(signal, fs, nfft, useWindow, 0.5);
 
         const xRange = readRange('xMinFreq', 'xMaxFreq');
         const yRange = readRange('yMinLevel', 'yMaxLevel');
         const minFreq = xRange.min !== null ? xRange.min : 20;
-        const maxFreq = xRange.max !== null ? xRange.max : Math.min(20000, cachedFs / 2);
+        const maxFreq = xRange.max !== null ? xRange.max : Math.min(20000, fs / 2);
 
         const data = [];
         for (let i = 0; i < freq.length; i++) {
@@ -345,9 +351,9 @@
                 data.push({ x: freq[i], y: spl[i] });
             }
         }
-        const ylabel = freqWeight === 'A' ? 'SPL (dBA)' :
-                       freqWeight === 'C' ? 'SPL (dBC)' :
-                                            'SPL (dB re 20 µPa)';
+        const ylabel = fw === 'A' ? 'SPL (dBA)' :
+                       fw === 'C' ? 'SPL (dBC)' :
+                                    'SPL (dB re 20 µPa)';
 
         const png = await renderChartToPng({
             type: 'line',
@@ -402,13 +408,11 @@
     async function pdfSpectrogram(doc) {
         const nfft = getFftSize();
         const useWindow = getUseWindow();
-        const freqWeight = getFreqWeight();
 
-        let signal = cachedSignalPa;
-        if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+        const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
         const { freq, time, spec, nBins, nFrames } =
-            sonogramSPL(signal, cachedFs, nfft, useWindow, 0.75);
+            sonogramSPL(signal, fs, nfft, useWindow, 0.75);
 
         let globalMax = -Infinity;
         for (let i = 0; i < spec.length; i++) {
@@ -448,83 +452,84 @@
     // -----------------------------------------------------------------------
     async function pdfBs4142(doc) {
         const tau = getTimeWeightTau();
-        const freqWeight = getFreqWeight();
+        const fw = getFreqWeight();
+        const tauLabel = (document.querySelector('input[name="timeWeight"]:checked') || {}).value || 'F';
 
-        let signal = cachedSignalPa;
-        if (freqWeight === 'A') signal = aWeight(signal, cachedFs);
+        const { signal, fs } = await applyFreqWeight(cachedSignalPa, cachedFs);
 
         const startY = drawHeader(doc, 'BS 4142 Analysis');
 
-        // ---- Leq summary table at top ----
-        const { selectedLeq, excludedLeq, selectedDuration, excludedDuration } =
-            computeLeq(signal, freqWeight);
-        const wLabel = freqWeight === 'A' ? ' dBA' : freqWeight === 'C' ? ' dBC' : ' dB';
+        // ---- Time series for Lp (100 ms) and short-time Leq (10 ms) ----
+        const lp       = computeLpTimeSeries(signal, fs, tau, /*stepSec*/ 0.1);
+        const leqShort = computeLeqShortTime(signal, fs, /*blockSec*/ 0.010);
+
+        // ---- Period summary table at top: Leq + L90 for selected + residual ----
+        const stats = computeLeq(signal, fs, lp);
+        const wLabel = fw === 'A' ? ' dBA' : fw === 'C' ? ' dBC' : ' dB';
 
         let y = startY;
         const pageW = doc.internal.pageSize.getWidth();
         const tableX = 15, tableW = pageW - 30;
-        const colW = tableW / 4;
+        // 5 columns: Period, Leq, L90, Duration, Regions
+        const colWs = [42, 36, 36, 36, tableW - 42 - 36 - 36 - 36];
+        const colX = [tableX];
+        for (let i = 0; i < colWs.length; i++) colX.push(colX[i] + colWs[i]);
 
-        // header row
+        // Header row
         doc.setFillColor(230);
         doc.rect(tableX, y, tableW, 7, 'F');
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(9);
         doc.setTextColor(0);
-        doc.text('',                tableX + 2,                y + 5);
-        doc.text('Leq',             tableX + colW + 2,         y + 5);
-        doc.text('Duration',        tableX + 2 * colW + 2,     y + 5);
-        doc.text('Regions',         tableX + 3 * colW + 2,     y + 5);
+        doc.text('Period',   colX[0] + 2, y + 5);
+        doc.text('Leq',      colX[1] + 2, y + 5);
+        doc.text('L90',      colX[2] + 2, y + 5);
+        doc.text('Duration', colX[3] + 2, y + 5);
+        doc.text('Regions',  colX[4] + 2, y + 5);
 
-        // selected row
+        // Selected row
         y += 7;
         doc.setDrawColor(180);
         doc.setLineWidth(0.2);
         doc.line(tableX, y, tableX + tableW, y);
         doc.setFont('helvetica', 'normal');
         doc.setTextColor(0);
-        doc.text('Selected', tableX + 2, y + 5);
+        doc.text('Selected Period', colX[0] + 2, y + 5);
         doc.setFont('helvetica', 'bold');
         doc.setTextColor(204, 0, 0);
-        doc.text(selectedLeq !== null ? selectedLeq.toFixed(1) + wLabel : '—',
-                 tableX + colW + 2, y + 5);
+        doc.text(stats.selectedLeq !== null ? stats.selectedLeq.toFixed(1) + wLabel : '—', colX[1] + 2, y + 5);
+        doc.text(stats.selectedL90 !== null ? stats.selectedL90 + wLabel             : '—', colX[2] + 2, y + 5);
         doc.setFont('helvetica', 'normal');
         doc.setTextColor(0);
-        doc.text(selectedDuration.toFixed(2) + ' s',
-                 tableX + 2 * colW + 2, y + 5);
-        doc.text(String(selectedRegions.length),
-                 tableX + 3 * colW + 2, y + 5);
+        doc.text(stats.selectedDuration.toFixed(2) + ' s', colX[3] + 2, y + 5);
+        doc.text(String(selectedRegions.length),           colX[4] + 2, y + 5);
 
-        // excluded row
+        // Residual row
         y += 7;
         doc.line(tableX, y, tableX + tableW, y);
         doc.setFont('helvetica', 'normal');
-        doc.text('Excluded', tableX + 2, y + 5);
+        doc.text('Residual Period', colX[0] + 2, y + 5);
         doc.setFont('helvetica', 'bold');
-        doc.text(excludedLeq !== null ? excludedLeq.toFixed(1) + wLabel : '—',
-                 tableX + colW + 2, y + 5);
+        doc.text(stats.excludedLeq !== null ? stats.excludedLeq.toFixed(1) + wLabel : '—', colX[1] + 2, y + 5);
+        doc.text(stats.excludedL90 !== null ? stats.excludedL90 + wLabel             : '—', colX[2] + 2, y + 5);
         doc.setFont('helvetica', 'normal');
-        doc.text(excludedDuration.toFixed(2) + ' s',
-                 tableX + 2 * colW + 2, y + 5);
-        doc.text('—', tableX + 3 * colW + 2, y + 5);
+        doc.text(stats.excludedDuration.toFixed(2) + ' s', colX[3] + 2, y + 5);
+        doc.text('—',                                      colX[4] + 2, y + 5);
         y += 7;
         doc.line(tableX, y, tableX + tableW, y);
-
         y += 6;
 
-        // ---- Top plot: Level vs. Time with region overlays ----
-        const weighted = timeWeight(signal, cachedFs, tau);
-        const spl = signalToSPL(weighted);
-        const { times, decimated } = decimateSignal(spl, cachedFs);
-        const data = times.map((t, i) => ({ x: t, y: decimated[i] }));
-        const ylabel = freqWeight === 'A' ? 'LA (dBA)' :
-                       freqWeight === 'C' ? 'LC (dBC)' :
-                                            'LZ (dB re 20 µPa)';
+        // ---- Top plot: dual-trace time history ----
+        const ylabel = fw === 'A' ? 'L (dBA)' :
+                       fw === 'C' ? 'L (dBC)' :
+                                    'L (dB re 20 µPa)';
+        const lpLabel  = `Lp ${tauLabel}-${fw === 'Lin' ? 'Z' : fw} (100 ms)`;
+        const leqLabel = `Leq-${fw === 'Lin' ? 'Z' : fw} (10 ms)`;
 
         const xRange = readRange('xMinTime', 'xMaxTime');
         const yRange = readRange('yMinLevel', 'yMaxLevel');
 
-        // Build region annotations as box fills (light grey for print)
+        // Region annotations as light grey boxes for print
         const annotations = {};
         selectedRegions.forEach((r, i) => {
             annotations['region' + i] = {
@@ -540,15 +545,30 @@
 
         const timePng = await renderChartToPng({
             type: 'line',
-            data: { datasets: [{
-                label: ylabel,
-                data: data,
-                borderColor: '#cc0000',
-                borderWidth: 1.2,
-                pointRadius: 0,
-                fill: false,
-                tension: 0
-            }] },
+            data: {
+                datasets: [
+                    {
+                        label: leqLabel,
+                        data: toXYPairs(leqShort.times, leqShort.values),
+                        borderColor: '#cc0000',
+                        borderWidth: 0.8,
+                        pointRadius: 0,
+                        fill: false,
+                        tension: 0,
+                        order: 2
+                    },
+                    {
+                        label: lpLabel,
+                        data: toXYPairs(lp.times, lp.values),
+                        borderColor: '#000000',
+                        borderWidth: 1.2,
+                        pointRadius: 0,
+                        fill: false,
+                        tension: 0,
+                        order: 1
+                    }
+                ]
+            },
             options: {
                 scales: printChartScales(
                     {
@@ -562,7 +582,13 @@
                         min: yRange.min, max: yRange.max
                     }
                 ),
-                plugins: { legend: { display: false }, annotation: { annotations } }
+                plugins: {
+                    legend: {
+                        display: true, position: 'top', align: 'end',
+                        labels: { color: '#000', boxWidth: 16, font: { size: 10 } }
+                    },
+                    annotation: { annotations }
+                }
             }
         }, 1600, 700);
 
@@ -572,7 +598,7 @@
         // ---- Bottom plot: Spectrogram with hot colourmap ----
         const nfft = getFftSize();
         const useWindow = getUseWindow();
-        const sono = sonogramSPL(signal, cachedFs, nfft, useWindow, 0.75);
+        const sono = sonogramSPL(signal, fs, nfft, useWindow, 0.75);
 
         let globalMax = -Infinity;
         for (let i = 0; i < sono.spec.length; i++) {
@@ -777,23 +803,27 @@
     }
 
     // -----------------------------------------------------------------------
-    //  Leq calculation (mirrors the version in nx43wr-analysis.js so the
-    //  PDF matches what's on screen).
+    //  Compute Leq (from the freq-weighted full-rate signal) and L90
+    //  (from a 100 ms Lp time series) for the selected and residual
+    //  partitions, in one pass each.
+    //
+    //  signal     - freq-weighted pressure samples
+    //  fs         - sample rate of `signal` (after any applyFreqWeight resample)
+    //  lpSeries   - { times, values } at 100 ms steps (already time/freq weighted)
     // -----------------------------------------------------------------------
-    function computeLeq(signal, freqWeight) {
+    function computeLeq(signal, fs, lpSeries) {
         const N = signal.length;
-        const fs = cachedFs;
         const pRefSq = 20e-6 * 20e-6;
 
         let selSumSq = 0, selCount = 0;
         let excSumSq = 0, excCount = 0;
         let totalSelDuration = 0;
+        const merged = mergeRegions(selectedRegions);
 
-        if (selectedRegions.length === 0) {
+        if (merged.length === 0) {
             for (let i = 0; i < N; i++) excSumSq += signal[i] * signal[i];
             excCount = N;
         } else {
-            const merged = mergeRegions(selectedRegions);
             totalSelDuration = merged.reduce((s, r) => s + (r.tEnd - r.tStart), 0);
             let regionIdx = 0;
             for (let i = 0; i < N; i++) {
@@ -806,6 +836,19 @@
             }
         }
 
+        // L90: split the Lp series the same way and compute the percentile
+        // of each partition (computeL90 is defined in nx43wr-analysis.js).
+        let selL90 = null, excL90 = null;
+        if (lpSeries && lpSeries.values && lpSeries.times) {
+            const selSamples = [], excSamples = [];
+            for (let i = 0; i < lpSeries.values.length; i++) {
+                const inside = isInsideMergedRegions(lpSeries.times[i], merged);
+                (inside ? selSamples : excSamples).push(lpSeries.values[i]);
+            }
+            if (selSamples.length > 0) selL90 = computeL90(selSamples);
+            if (excSamples.length > 0) excL90 = computeL90(excSamples);
+        }
+
         return {
             selectedLeq: selCount > 0
                 ? 10 * Math.log10((selSumSq / selCount) / pRefSq + 1e-30)
@@ -813,6 +856,8 @@
             excludedLeq: excCount > 0
                 ? 10 * Math.log10((excSumSq / excCount) / pRefSq + 1e-30)
                 : null,
+            selectedL90: selL90,
+            excludedL90: excL90,
             selectedDuration: totalSelDuration,
             excludedDuration: excCount / fs
         };
